@@ -160,3 +160,6 @@ wandb/
 *.out
 
 ._version.py
+
+
+data/

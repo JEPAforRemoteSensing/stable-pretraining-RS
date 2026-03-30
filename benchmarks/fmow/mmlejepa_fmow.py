@@ -90,17 +90,23 @@ def make_eval_transform_ms():
 # ---------------------------------------------------------------------------
 
 def mmlejepa_forward(self, batch, stage):
-    """MMLeJEPA forward: dual-encoder SSL with SIGReg + cross-modal alignment.
+    """MEMPLeJEPA forward: dual-encoder SSL with per-modality SIGReg + retrieval probes.
 
     Expects ``self`` to have:
-        - ``encoder_rgb``, ``encoder_ms``: backbone encoders
+        - ``encoder_rgb``, ``encoder_ms``: backbone encoders (trained with SIGReg only)
         - ``projector_rgb``, ``projector_ms``: MLP projection heads
+        - ``ret_probe_rgb2ms``: MLP probe mapping RGB→MS embedding space
+        - ``ret_probe_ms2rgb``: MLP probe mapping MS→RGB embedding space
         - ``mmlejepa_loss``: :class:`MMLeJEPALoss` instance
 
     Batch keys:
         - ``image_rgb``: ``(B, V, 3, H, W)`` (training) or ``(B, 3, H, W)`` (eval)
         - ``image_ms``:  ``(B, V, 10, H, W)`` (training) or ``(B, 10, H, W)`` (eval)
         - ``label``: ``(B,)`` integer class labels
+
+    Retrieval probes are trained with MSE on detached encoder outputs:
+        - ``MSE(ret_probe_rgb2ms(emb_rgb.detach()), emb_ms.detach())``
+        - ``MSE(ret_probe_ms2rgb(emb_ms.detach()), emb_rgb.detach())``
     """
     out = {}
 
@@ -121,25 +127,51 @@ def mmlejepa_forward(self, batch, stage):
         proj_rgb_views = proj_rgb.reshape(B, V, -1).permute(1, 0, 2)
         proj_ms_views = proj_ms.reshape(B, V, -1).permute(1, 0, 2)
 
-        loss, loss_components = self.mmlejepa_loss(proj_rgb_views, proj_ms_views)
+        sigreg_loss, loss_components = self.mmlejepa_loss(proj_rgb_views, proj_ms_views)
+
+        # Mean over views for probe training and retrieval callbacks
+        D = emb_rgb.shape[-1]
+        emb_rgb_mean = emb_rgb.reshape(B, V, D).mean(1)  # (B, D)
+        emb_ms_mean = emb_ms.reshape(B, V, D).mean(1)   # (B, D)
+
+        # --- Retrieval probes: trained on detached encoder outputs ---
+        emb_rgb_det = emb_rgb_mean.detach()
+        emb_ms_det = emb_ms_mean.detach()
+
+        embhat_rgb2ms = self.ret_probe_rgb2ms(emb_rgb_det)  # (B, D)
+        embhat_ms2rgb = self.ret_probe_ms2rgb(emb_ms_det)   # (B, D)
+
+        probe_loss_rgb2ms = nn.functional.mse_loss(embhat_rgb2ms, emb_ms_det)
+        probe_loss_ms2rgb = nn.functional.mse_loss(embhat_ms2rgb, emb_rgb_det)
+        probe_loss = probe_loss_rgb2ms + probe_loss_ms2rgb
+
+        loss = sigreg_loss + self.ret_probe_weight * probe_loss
         out["loss"] = loss
 
-        # Log individual loss components
+        # Log loss components
         for k, v in loss_components.items():
             self.log(f"{stage}/{k}", v, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/probe_loss/rgb2ms", probe_loss_rgb2ms.detach(), on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/probe_loss/ms2rgb", probe_loss_ms2rgb.detach(), on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, sync_dist=True)
 
-        # Mean over views for probes and retrieval callbacks
-        D = emb_rgb.shape[-1]
-        out["embedding_rgb"] = emb_rgb.reshape(B, V, D).mean(1)
-        out["embedding_ms"] = emb_ms.reshape(B, V, D).mean(1)
+        out["embedding_rgb"] = emb_rgb_mean
+        out["embedding_ms"] = emb_ms_mean
+        out["embhat_rgb2ms"] = embhat_rgb2ms
+        out["embhat_ms2rgb"] = embhat_ms2rgb
 
     else:
         # --- Eval: single view ---
-        out["embedding_rgb"] = self.encoder_rgb(batch["image_rgb"])
-        out["embedding_ms"] = self.encoder_ms(batch["image_ms"])
+        emb_rgb = self.encoder_rgb(batch["image_rgb"])
+        emb_ms = self.encoder_ms(batch["image_ms"])
+        out["embedding_rgb"] = emb_rgb
+        out["embedding_ms"] = emb_ms
+        out["embhat_rgb2ms"] = self.ret_probe_rgb2ms(emb_rgb.detach())
+        out["embhat_ms2rgb"] = self.ret_probe_ms2rgb(emb_ms.detach())
 
     out["label"] = batch["label"]
+    if "sample_idx" in batch:
+        out["sample_idx"] = batch["sample_idx"]
     return out
 
 
@@ -166,6 +198,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--lamb", type=float, default=0.02, help="SIGReg weight")
     p.add_argument("--num_slices", type=int, default=256, help="SIGReg slices")
+    p.add_argument("--ret_probe_weight", type=float, default=1.0, help="retrieval probe MSE loss weight")
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--precision", type=str, default="16-mixed")
     p.add_argument("--devices", type=int, default=1)
@@ -253,6 +286,12 @@ def main():
     projector_ms = MLP(
         args.embed_dim, [4096, 4096, args.proj_dim], norm_layer=nn.BatchNorm1d,
     )
+    ret_probe_rgb2ms = MLP(
+        args.embed_dim, [2048, args.embed_dim], norm_layer=nn.BatchNorm1d,
+    )
+    ret_probe_ms2rgb = MLP(
+        args.embed_dim, [2048, args.embed_dim], norm_layer=nn.BatchNorm1d,
+    )
 
     # ---- Loss ----
     mmlejepa_loss = MMLeJEPALoss(
@@ -270,7 +309,10 @@ def main():
         encoder_ms=encoder_ms,
         projector_rgb=projector_rgb,
         projector_ms=projector_ms,
+        ret_probe_rgb2ms=ret_probe_rgb2ms,
+        ret_probe_ms2rgb=ret_probe_ms2rgb,
         mmlejepa_loss=mmlejepa_loss,
+        ret_probe_weight=args.ret_probe_weight,
         forward=mmlejepa_forward,
         optim={
             "optimizer": {
@@ -316,6 +358,9 @@ def main():
         )
 
     # Online KNN probes (one per modality)
+    # Note: OnlineKNN infers num_classes from cached labels, which can be < 62
+    # early in training if the queue hasn't seen all classes. We use a large
+    # queue and avoid top_k to minimise mismatches.
     for modality, dim in [("rgb", args.embed_dim), ("ms", args.embed_dim)]:
         callbacks.append(
             spt.callbacks.OnlineKNN(
@@ -326,7 +371,9 @@ def main():
                 input_dim=dim,
                 k=args.knn_k,
                 metrics={
-                    "top1": torchmetrics.classification.MulticlassAccuracy(NUM_CLASSES),
+                    "top1": torchmetrics.classification.MulticlassAccuracy(
+                        NUM_CLASSES, validate_args=False,
+                    ),
                 },
             )
         )
@@ -349,6 +396,8 @@ def main():
             name="xmodal_retrieval",
             input_rgb="embedding_rgb",
             input_ms="embedding_ms",
+            input_rgb2ms="embhat_rgb2ms",
+            input_ms2rgb="embhat_ms2rgb",
             features_dim=args.embed_dim,
             top_k=tuple(args.top_k),
         )

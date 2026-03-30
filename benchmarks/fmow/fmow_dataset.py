@@ -115,6 +115,9 @@ class FMoWStreamingDataset(StreamingDataset):
     def __getitem__(self, idx):
         data = super().__getitem__(idx)
 
+        # litdata passes ChunkedIndex objects; extract the plain int
+        sample_idx = idx if isinstance(idx, int) else getattr(idx, "index", 0)
+
         rgb_np = np.array(data["rgb"], dtype=np.uint8)  # (H, W, 3)
         ms_np = np.array(data["ms"], dtype=np.uint8)  # (H, W, 10)
         label = CAT_TO_IDX[data["category"]]
@@ -134,5 +137,5 @@ class FMoWStreamingDataset(StreamingDataset):
             "image_rgb": views_rgb,
             "image_ms": views_ms,
             "label": label,
-            "sample_idx": idx,
+            "sample_idx": sample_idx,
         }

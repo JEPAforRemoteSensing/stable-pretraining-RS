@@ -1,31 +1,34 @@
-"""MMLeJEPA loss: SIGReg + invariance + cross-modal alignment.
+"""MMLeJEPA loss: per-modality SIGReg + invariance (no cross-modal term).
 
-Reuses ``SlicedEppsPulley`` from ``stable_pretraining.methods.lejepa``
-for the SIGReg regularisation term.
+Each encoder is regularised independently; cross-modal alignment is handled
+separately by the retrieval probes (MSE in the forward function).
+
+Reuses ``SlicedEppsPulley`` from ``stable_pretraining.methods.lejepa``.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from stable_pretraining.methods.lejepa import SlicedEppsPulley
 
 
 class MMLeJEPALoss(nn.Module):
-    """Multi-modal LeJEPA loss.
+    """Per-modality SIGReg + invariance loss.
 
-    Combines three objectives:
+    Each modality's projected embeddings are regularised independently:
 
-    1. **SIGReg** (per modality): sliced Epps-Pulley goodness-of-fit test
-       that pushes projected embeddings toward an isotropic Gaussian.
-    2. **Invariance** (per modality): MSE between each view's projection
-       and the modality-wise center, enforcing view consistency.
-    3. **Cross-modal alignment**: cosine similarity between the RGB and MS
-       projection centres, pulling the two modalities together.
+    1. **SIGReg**: sliced Epps-Pulley test that pushes projections toward
+       an isotropic Gaussian.
+    2. **Invariance**: MSE between each view's projection and the
+       modality-wise centre, enforcing view consistency.
+
+    No cross-modal term — encoder gradients come only from this loss.
+    Cross-modal alignment is achieved via the retrieval probes trained
+    with MSE on detached encoder outputs.
 
     Args:
-        lamb: Trade-off weight.  ``loss = lamb * sigreg + (1-lamb) * invariance``.
-        num_slices: Number of random 1-D projections for SIGReg.
+        lamb: ``loss = lamb * sigreg + (1-lamb) * invariance``.
+        num_slices: Random 1-D projections for SIGReg.
         t_max: EP integration upper bound.
         n_points: EP quadrature nodes.
     """
@@ -51,25 +54,19 @@ class MMLeJEPALoss(nn.Module):
             proj_ms:  Projected MS embeddings  ``(V, B, K)``.
 
         Returns:
-            Tuple of ``(total_loss, loss_dict)`` where *loss_dict* contains
-            individual components for logging.
+            Tuple of ``(total_loss, loss_dict)``.
         """
         # --- SIGReg: push each modality toward isotropic Gaussian ---
         sigreg_rgb = self.sigreg(proj_rgb.reshape(-1, proj_rgb.size(-1)))
         sigreg_ms = self.sigreg(proj_ms.reshape(-1, proj_ms.size(-1)))
         sigreg_loss = sigreg_rgb + sigreg_ms
 
-        # --- Invariance: pull views to modality centre ---
+        # --- Invariance: pull views to their modality-wise centre ---
         inv_rgb = (proj_rgb.mean(0) - proj_rgb).square().mean()
         inv_ms = (proj_ms.mean(0) - proj_ms).square().mean()
         inv_loss = inv_rgb + inv_ms
 
-        # --- Cross-modal: pull RGB and MS centres together ---
-        cross_loss = F.cosine_similarity(
-            proj_rgb.mean(0), proj_ms.mean(0), dim=-1
-        ).mean()
-
-        total = self.lamb * sigreg_loss + (1 - self.lamb) * inv_loss - cross_loss
+        total = self.lamb * sigreg_loss + (1 - self.lamb) * inv_loss
 
         loss_dict = {
             "sigreg/rgb": sigreg_rgb.detach(),
@@ -78,7 +75,6 @@ class MMLeJEPALoss(nn.Module):
             "invariance/rgb": inv_rgb.detach(),
             "invariance/ms": inv_ms.detach(),
             "invariance/total": inv_loss.detach(),
-            "cross_modal/cosine": cross_loss.detach(),
         }
 
         return total, loss_dict

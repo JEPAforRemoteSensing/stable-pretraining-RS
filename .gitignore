@@ -163,3 +163,10 @@ wandb/
 
 
 data/
+environment_v*.json
+requirements_frozen_v*.txt
+requirements_frozen.txt
+lightning_logs/
+benchmarks/
+checkpoints/
+hf_exports/

@@ -167,6 +167,7 @@ environment_v*.json
 requirements_frozen_v*.txt
 requirements_frozen.txt
 lightning_logs/
-benchmarks/
+benchmarks/*/checkpoints/
 checkpoints/
 hf_exports/
+nohup.out
